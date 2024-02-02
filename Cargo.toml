@@ -13,7 +13,7 @@ publish = false
 build = "build.rs"
 
 [features]
-# default = ["sqlite"]
+default = ["sqlite"]
 # Empty to keep compatibility, prefer to set USE_SYSLOG=true
 enable_syslog = []
 mysql = ["diesel/mysql", "diesel_migrations/mysql"]
@@ -43,7 +43,7 @@ syslog = "6.1.0"
 log = "0.4.20"
 fern = { version = "0.6.2", features = ["syslog-6", "reopen-1"] }
 tracing = { version = "0.1.40", features = ["log"] } # Needed to have lettre and webauthn-rs trace logging to work
-
+axum-jwks = "0.6.2"
 # A `dotenv` implementation for Rust
 dotenvy = { version = "0.15.7", default-features = false }
 
