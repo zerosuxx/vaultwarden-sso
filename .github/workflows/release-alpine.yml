@@ -127,7 +127,7 @@ jobs:
           pull: true
           push: true
           files: docker/docker-bake.hcl
-          targets: "${{ matrix.base_image }}-alpine"
+          targets: "${{ matrix.base_image }}"
 
       - name: Push images to registry
         run: |
