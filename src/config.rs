@@ -645,6 +645,8 @@ make_config! {
         sso_organizations_token_path:   String, true,   def,    "/groups".to_string();
         /// Deactivate saving the master password
         sso_experimental_no_master_pwd: bool,   true,   def,    false;
+        /// Enable jwk tokens validations
+        sso_jwk_validation_enabled:     bool,   false,   def,    false;
     },
 
     /// Yubikey settings

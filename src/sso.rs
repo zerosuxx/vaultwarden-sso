@@ -3,11 +3,13 @@ use rocket::{http::CookieJar, response::Redirect};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
+use axum_jwks::Jwks;
 use url::Url;
 
 use jsonwebtoken::{DecodingKey, Validation};
+use jsonwebtoken::errors::ErrorKind;
 use mini_moka::sync::Cache;
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType, CoreUserInfoClaims};
 use openidconnect::reqwest::async_http_client;
 use openidconnect::{
@@ -15,17 +17,9 @@ use openidconnect::{
     OAuth2TokenResponse, RefreshToken, Scope,
 };
 use regex::Regex;
+use serde::de::DeserializeOwned;
 
-use crate::{
-    api::core::organizations::CollectionData,
-    api::ApiResult,
-    auth,
-    auth::{AuthMethodScope, ClientIp, TokenWrapper, DEFAULT_REFRESH_VALIDITY},
-    business::organization_logic,
-    db::models::{Device, EventType, Organization, SsoNonce, User, UserOrgType, UserOrganization},
-    db::DbConn,
-    CONFIG,
-};
+use crate::{api::core::organizations::CollectionData, api::ApiResult, auth, auth::{AuthMethodScope, ClientIp, TokenWrapper, DEFAULT_REFRESH_VALIDITY}, business::organization_logic, db::models::{Device, EventType, Organization, SsoNonce, User, UserOrgType, UserOrganization}, db::DbConn, CONFIG};
 
 pub static COOKIE_NAME_REDIRECT: &str = "sso_redirect_url";
 pub static FAKE_IDENTIFIER: &str = "VaultWarden";
@@ -36,13 +30,33 @@ static AC_CACHE: Lazy<Cache<String, AuthenticatedUser>> =
 static CLIENT_CACHE: RwLock<Option<CoreClient>> = RwLock::new(None);
 
 static SSO_JWT_VALIDATION: Lazy<Decoding> = Lazy::new(prepare_decoding);
-
+static SSO_JWKS_VALIDATION: OnceCell<Jwks> = OnceCell::new();
 static DEFAULT_BW_EXPIRATION: Lazy<chrono::Duration> = Lazy::new(|| chrono::Duration::minutes(5));
 static SSO_ERRORS_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^error_(.*)$").unwrap());
 
 // Will Panic if SSO is activated and a key file is present but we can't decode its content
 pub fn pre_load_sso_jwt_validation() {
     Lazy::force(&SSO_JWT_VALIDATION);
+}
+
+pub async fn pre_load_sso_jwk_validation() {
+    if !CONFIG.sso_enabled() || !CONFIG.sso_jwk_validation_enabled() {
+        return;
+    }
+
+    let jwks_result = Jwks::from_oidc_url(
+        &format!("{}/.well-known/openid-configuration", CONFIG.sso_authority()),
+        CONFIG.sso_client_id().to_owned(),
+    ).await;
+
+    match jwks_result {
+        Ok(r) => {
+            let _ = SSO_JWKS_VALIDATION.set(r);
+        },
+        Err(e) => {
+            panic!("Failed to load JSON Web Keys: {:?}", e);
+        }
+    }
 }
 
 #[rocket::async_trait]
@@ -192,7 +206,7 @@ impl Decoding {
         }
     }
 
-    pub fn id_token<
+    pub async fn id_token<
         AC: openidconnect::AdditionalClaims,
         GC: openidconnect::GenderClaim,
         JE: openidconnect::JweContentEncryptionAlgorithm<JT>,
@@ -207,8 +221,8 @@ impl Decoding {
             Some(token) => token.to_string(),
         };
 
-        match jsonwebtoken::decode::<IdTokenPayload>(id_token_str.as_str(), &self.key, &self.id_validation) {
-            Ok(payload) => Ok(payload.claims),
+        match self.decode_token::<IdTokenPayload>(id_token_str.as_str(), &self.id_validation) {
+            Ok(claims) => Ok(claims),
             Err(err) => {
                 self.log_debug("identity_token", id_token_str.as_str());
                 err!(format!("Could not decode id token: {err}"))
@@ -260,11 +274,11 @@ impl Decoding {
 
             self.log_debug("access_token", access_token_str);
 
-            match jsonwebtoken::decode::<serde_json::Value>(access_token_str, &self.key, &self.access_validation) {
+            match self.decode_token::<serde_json::Value>(access_token_str, &self.access_validation) {
                 Err(err) => err!(format!("Could not decode access token: {:?}", err)),
-                Ok(payload) => {
+                Ok(claims) => {
                     if CONFIG.sso_roles_enabled() {
-                        role = Self::roles(email, &payload.claims);
+                        role = Self::roles(email, &claims);
                         if !CONFIG.sso_roles_default_to_user() && role.is_none() {
                             info!("User {email} failed to login due to missing/invalid role");
                             err!(
@@ -277,7 +291,7 @@ impl Decoding {
                     }
 
                     if CONFIG.sso_organizations_invite() {
-                        groups = Self::groups(email, &payload.claims);
+                        groups = Self::groups(email, &claims);
                     }
                 }
             }
@@ -290,11 +304,25 @@ impl Decoding {
     }
 
     pub fn basic_token(&self, token_name: &str, token: &str) -> ApiResult<BasicTokenPayload> {
-        match jsonwebtoken::decode::<BasicTokenPayload>(token, &self.key, &self.access_validation) {
-            Ok(payload) => Ok(payload.claims),
+        match self.decode_token::<BasicTokenPayload>(token, &self.access_validation) {
+            Ok(claims) => Ok(claims),
             Err(err) => {
                 self.log_debug(token_name, token);
                 err_silent!(format!("Could not decode {token_name}: {err}"))
+            }
+        }
+    }
+
+    pub fn decode_token<T: DeserializeOwned>(&self, token: &str, validation: &Validation) -> Result<T, jsonwebtoken::errors::Error> {
+        if CONFIG.sso_jwk_validation_enabled() {
+            match SSO_JWKS_VALIDATION.get().unwrap().validate_claims::<T>(token) {
+                Ok(payload) => Ok(payload.claims),
+                Err(_err) => Err(jsonwebtoken::errors::Error::from(ErrorKind::InvalidSignature)),
+            }
+        } else {
+            match jsonwebtoken::decode::<T>(token, &self.key, &validation) {
+                Ok(payload) => Ok(payload.claims),
+                Err(err) => Err(jsonwebtoken::errors::Error::from(err.kind().clone())),
             }
         }
     }
@@ -414,7 +442,7 @@ pub async fn exchange_code(code: &String) -> ApiResult<UserInformation> {
     match client.exchange_code(oidc_code).request_async(async_http_client).await {
         Ok(token_response) => {
             let user_info = client.user_info_async(token_response.access_token().to_owned()).await?;
-            let id_token = SSO_JWT_VALIDATION.id_token(token_response.extra_fields().id_token())?;
+            let id_token = SSO_JWT_VALIDATION.id_token(token_response.extra_fields().id_token()).await?;
             let user_name = user_info.preferred_username().map(|un| un.to_string());
 
             let email = match id_token.email {

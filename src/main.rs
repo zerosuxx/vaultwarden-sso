@@ -110,6 +110,7 @@ async fn main() -> Result<(), Error> {
     });
     check_web_vault();
     crate::sso::pre_load_sso_jwt_validation();
+    sso::pre_load_sso_jwk_validation().await;
 
     create_dir(&CONFIG.icon_cache_folder(), "icon cache");
     create_dir(&CONFIG.tmp_folder(), "tmp folder");
