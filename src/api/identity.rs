@@ -226,7 +226,7 @@ async fn _sso_login(
         auth_user.refresh_token,
         &auth_user.access_token,
         auth_user.expires_in,
-    )?;
+    ).await?;
 
     authenticated_response(&user, &mut device, new_device, auth_tokens, twofactor_token, &now, conn, ip).await
 }

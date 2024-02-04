@@ -3,11 +3,12 @@ use rocket::{http::CookieJar, response::Redirect};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
-use axum_jwks::Jwks;
 use url::Url;
 
-use jsonwebtoken::{DecodingKey, Validation};
-use jsonwebtoken::errors::ErrorKind;
+use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
+
+use jsonwebtoken::errors::ErrorKind::InvalidKeyFormat;
+use jwt_authorizer::{Authorizer, JwtAuthorizer};
 use mini_moka::sync::Cache;
 use once_cell::sync::{Lazy, OnceCell};
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType, CoreUserInfoClaims};
@@ -30,7 +31,7 @@ static AC_CACHE: Lazy<Cache<String, AuthenticatedUser>> =
 static CLIENT_CACHE: RwLock<Option<CoreClient>> = RwLock::new(None);
 
 static SSO_JWT_VALIDATION: Lazy<Decoding> = Lazy::new(prepare_decoding);
-static SSO_JWKS_VALIDATION: OnceCell<Jwks> = OnceCell::new();
+static SSO_JWT_AUTHORIZER: OnceCell<Authorizer> = OnceCell::new();
 static DEFAULT_BW_EXPIRATION: Lazy<chrono::Duration> = Lazy::new(|| chrono::Duration::minutes(5));
 static SSO_ERRORS_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^error_(.*)$").unwrap());
 
@@ -39,22 +40,26 @@ pub fn pre_load_sso_jwt_validation() {
     Lazy::force(&SSO_JWT_VALIDATION);
 }
 
-pub async fn pre_load_sso_jwk_validation() {
-    if !CONFIG.sso_enabled() || !CONFIG.sso_jwk_validation_enabled() {
+pub async fn pre_load_sso_jwt_authorizer() {
+    if !CONFIG.sso_enabled() || !CONFIG.sso_jwt_authorizer_enabled() {
         return;
     }
 
-    let jwks_result = Jwks::from_oidc_url(
-        &format!("{}/.well-known/openid-configuration", CONFIG.sso_authority()),
-        CONFIG.sso_client_id().to_owned(),
-    ).await;
+    let authorizer_result = JwtAuthorizer::from_oidc(CONFIG.sso_authority().as_str())
+        .refresh(Default::default())
+        .validation(jwt_authorizer::Validation {
+            aud: Some(vec![CONFIG.sso_client_id()]),
+            ..Default::default()
+        })
+        .build()
+        .await;
 
-    match jwks_result {
+    match authorizer_result {
         Ok(r) => {
-            let _ = SSO_JWKS_VALIDATION.set(r);
+            let _ = SSO_JWT_AUTHORIZER.set(r);
         },
         Err(e) => {
-            panic!("Failed to load JSON Web Keys: {:?}", e);
+            panic!("Failed to initialize JWT Authorizer: {:?}", e);
         }
     }
 }
@@ -221,7 +226,7 @@ impl Decoding {
             Some(token) => token.to_string(),
         };
 
-        match self.decode_token::<IdTokenPayload>(id_token_str.as_str(), &self.id_validation) {
+        match self.decode_token::<IdTokenPayload>(id_token_str.as_str(), &self.id_validation).await {
             Ok(claims) => Ok(claims),
             Err(err) => {
                 self.log_debug("identity_token", id_token_str.as_str());
@@ -265,7 +270,7 @@ impl Decoding {
         }
     }
 
-    fn access_token(&self, email: &str, access_token: &AccessToken) -> ApiResult<AccessTokenPayload> {
+    async fn access_token(&self, email: &str, access_token: &AccessToken) -> ApiResult<AccessTokenPayload> {
         let mut role = None;
         let mut groups = Vec::new();
 
@@ -274,7 +279,7 @@ impl Decoding {
 
             self.log_debug("access_token", access_token_str);
 
-            match self.decode_token::<serde_json::Value>(access_token_str, &self.access_validation) {
+            match self.decode_token::<serde_json::Value>(access_token_str, &self.access_validation).await {
                 Err(err) => err!(format!("Could not decode access token: {:?}", err)),
                 Ok(claims) => {
                     if CONFIG.sso_roles_enabled() {
@@ -303,8 +308,8 @@ impl Decoding {
         })
     }
 
-    pub fn basic_token(&self, token_name: &str, token: &str) -> ApiResult<BasicTokenPayload> {
-        match self.decode_token::<BasicTokenPayload>(token, &self.access_validation) {
+    pub async fn basic_token(&self, token_name: &str, token: &str) -> ApiResult<BasicTokenPayload> {
+        match self.decode_token::<BasicTokenPayload>(token, &self.access_validation).await {
             Ok(claims) => Ok(claims),
             Err(err) => {
                 self.log_debug(token_name, token);
@@ -313,14 +318,26 @@ impl Decoding {
         }
     }
 
-    pub fn decode_token<T: DeserializeOwned>(&self, token: &str, validation: &Validation) -> Result<T, jsonwebtoken::errors::Error> {
-        if CONFIG.sso_jwk_validation_enabled() {
-            match SSO_JWKS_VALIDATION.get().unwrap().validate_claims::<T>(token) {
+    pub async fn decode_token<T: DeserializeOwned + Clone + Send>(&self, token: &str, validation: &Validation) -> Result<T, jsonwebtoken::errors::Error> {
+        if CONFIG.sso_jwt_authorizer_enabled() {
+            let authorizer = SSO_JWT_AUTHORIZER.get().unwrap();
+            let header_result = decode_header(token);
+            if header_result.is_err() {
+                return Err(header_result.err().unwrap());
+            }
+
+            let key_result = authorizer.key_source.get_key(header_result.unwrap()).await;
+            if key_result.is_err() {
+                println!("[ERROR] Failed to load JSON Web Key: {:?}", key_result.err().unwrap());
+                return Err(jsonwebtoken::errors::Error::from(InvalidKeyFormat));
+            }
+
+            match decode::<T>(token, &key_result.unwrap().key, &secure_validation()) {
                 Ok(payload) => Ok(payload.claims),
-                Err(_err) => Err(jsonwebtoken::errors::Error::from(ErrorKind::InvalidSignature)),
+                Err(err) => Err(jsonwebtoken::errors::Error::from(err.kind().clone())),
             }
         } else {
-            match jsonwebtoken::decode::<T>(token, &self.key, &validation) {
+            match decode::<T>(token, &self.key, &validation) {
                 Ok(payload) => Ok(payload.claims),
                 Err(err) => Err(jsonwebtoken::errors::Error::from(err.kind().clone())),
             }
@@ -331,6 +348,17 @@ impl Decoding {
         let _ = jsonwebtoken::decode::<serde_json::Value>(token, &self.debug_key, &self.debug_validation)
             .map(|payload| debug!("Token {token_name}: {}", payload.claims));
     }
+}
+
+fn secure_validation() -> Validation {
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.leeway = 30;
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.set_audience(&[CONFIG.sso_client_id()]);
+    validation.set_issuer(&[CONFIG.sso_authority()]);
+
+    validation
 }
 
 fn insecure_validation() -> Validation {
@@ -361,16 +389,7 @@ fn prepare_decoding() -> Decoding {
     });
 
     match maybe_key {
-        Some(key) => {
-            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-            validation.leeway = 30; // 30 seconds
-            validation.validate_exp = true;
-            validation.validate_nbf = true;
-            validation.set_audience(&[CONFIG.sso_client_id()]);
-            validation.set_issuer(&[CONFIG.sso_authority()]);
-
-            Decoding::new(key, validation)
-        }
+        Some(key) => Decoding::new(key, secure_validation()),
         None => Decoding::new(DecodingKey::from_secret(&[]), insecure_validation()),
     }
 }
@@ -453,7 +472,7 @@ pub async fn exchange_code(code: &String) -> ApiResult<UserInformation> {
                 },
             };
 
-            let access_token = SSO_JWT_VALIDATION.access_token(&email, token_response.access_token())?;
+            let access_token = SSO_JWT_VALIDATION.access_token(&email, token_response.access_token()).await?;
 
             let refresh_token = token_response.refresh_token().map(|t| t.secret().to_string());
             if refresh_token.is_none() && CONFIG.sso_scopes_vec().contains(&"offline_access".to_string()) {
@@ -502,14 +521,14 @@ pub async fn redeem(code: &String, conn: &mut DbConn) -> ApiResult<Authenticated
 
 // We always return a refresh_token (with no refresh_token some secrets are not displayed in the web front).
 // If there is no SSO refresh_token, we keep the access_token to be able to call user_info to check for validity
-pub fn create_auth_tokens(
+pub async fn create_auth_tokens(
     device: &Device,
     user: &User,
     refresh_token: Option<String>,
     access_token: &str,
     expires_in: Option<Duration>,
 ) -> ApiResult<auth::AuthTokens> {
-    let (ap_nbf, ap_exp) = match (SSO_JWT_VALIDATION.basic_token("access_token", access_token), expires_in) {
+    let (ap_nbf, ap_exp) = match (SSO_JWT_VALIDATION.basic_token("access_token", access_token).await, expires_in) {
         (Ok(ap), _) => (ap.nbf(), ap.exp),
         (Err(_), Some(exp)) => {
             let time_now = Utc::now().naive_utc();
@@ -520,17 +539,17 @@ pub fn create_auth_tokens(
 
     let access_claims = auth::LoginJwtClaims::new(device, user, ap_nbf, ap_exp, auth::AuthMethod::Sso.scope_vec());
 
-    _create_auth_tokens(device, refresh_token, access_claims, access_token)
+    _create_auth_tokens(device, refresh_token, access_claims, access_token).await
 }
 
-fn _create_auth_tokens(
+async fn _create_auth_tokens(
     device: &Device,
     refresh_token: Option<String>,
     access_claims: auth::LoginJwtClaims,
     access_token: &str,
 ) -> ApiResult<auth::AuthTokens> {
     let (nbf, exp, token) = if let Some(rt) = refresh_token.as_ref() {
-        match SSO_JWT_VALIDATION.basic_token("refresh_token", rt) {
+        match SSO_JWT_VALIDATION.basic_token("refresh_token", rt).await {
             Err(_) => {
                 let time_now = Utc::now().naive_utc();
                 let exp = (time_now + *DEFAULT_REFRESH_VALIDITY).timestamp();
@@ -593,12 +612,12 @@ pub async fn exchange_refresh_token(
                 Some(rolled_refresh_token),
                 token_response.access_token().secret(),
                 token_response.expires_in(),
-            )
+            ).await
         }
         Some(TokenWrapper::Access(access_token)) => {
             let exp_limit = (Utc::now().naive_utc() + *DEFAULT_BW_EXPIRATION).timestamp();
 
-            match SSO_JWT_VALIDATION.basic_token("access_token", access_token) {
+            match SSO_JWT_VALIDATION.basic_token("access_token", access_token).await {
                 Err(err) => err!(format!("Impossible to read access_token: {err}")),
                 Ok(claims) if claims.exp < exp_limit => {
                     err_silent!("Access token is close to expiration but we have no refresh token")
@@ -618,7 +637,7 @@ pub async fn exchange_refresh_token(
                                 claims.exp,
                                 auth::AuthMethod::Sso.scope_vec(),
                             );
-                            _create_auth_tokens(device, None, access_claims, access_token)
+                            _create_auth_tokens(device, None, access_claims, access_token).await
                         }
                     }
                 }
